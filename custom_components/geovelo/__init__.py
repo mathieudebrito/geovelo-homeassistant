@@ -15,11 +15,12 @@ from itertools import dropwhile, takewhile
 import aiohttp
 from dataclasses import dataclass
 from collections.abc import Callable
+from awesomeversion import AwesomeVersion
 
 from homeassistant.components.sensor.const import SensorStateClass
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.const import Platform, STATE_ON
+from homeassistant.const import Platform, STATE_ON, __short_version__ as HA_VERSION
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.config_entries import ConfigEntry
@@ -240,10 +241,16 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
 
 
 class GeoveloUtilityMeterSensor(UtilityMeterSensor):
-    def __init__(self, icon, device_class, **args):
-        super().__init__(**args)
-        self._attr_device_class = device_class
-        self._attr_icon = icon
+    def __init__(self, hass, **args):
+        self._attr_device_class = args["device_class"]
+        self._attr_icon = args["icon"]
+        del args["icon"]
+        del args["device_class"]
+        if AwesomeVersion(HA_VERSION) < AwesomeVersion("2025.8"):
+            super().__init__(**args)
+        else:
+            super().__init__(hass, **args)
+
 
     @property
     def device_class(self) -> SensorDeviceClass | None:
@@ -294,24 +301,30 @@ class GeoveloSensorEntity(CoordinatorEntity, SensorEntity):
         await super().async_added_to_hass()
         if self.entity_description.monthly_utility:
             name = self.name.replace("Total ", "")
+            kwargs = {}
+            if AwesomeVersion(HA_VERSION) < AwesomeVersion("2025.8"):
+                kwargs["device_info"] = self.device_info
+            kwargs["icon"] = self.entity_description.icon
+            kwargs["device_class"] = self.entity_description.device_class
+            kwargs["meter_type"] = "monthly"
+            kwargs["name"] = f"Monthly {name}"
+            kwargs["source_entity"] = self.entity_id
+            kwargs["unique_id"] = f"{self.unique_id}_monthly"
+            kwargs["cron_pattern"] = None
+            kwargs["delta_values"] = None
+            kwargs["meter_offset"] = timedelta(seconds=0)
+            kwargs["net_consumption"] = None
+            kwargs["parent_meter"] = self.config_entry.entry_id  # not sure of what it does!
+            kwargs["periodically_resetting"] = False
+            kwargs["tariff_entity"] = None
+            kwargs["tariff"] = None
+            kwargs["sensor_always_available"] = True
+
             monthly = GeoveloUtilityMeterSensor(
-                icon=self.entity_description.icon,
-                device_class=self.entity_description.device_class,
-                meter_type="monthly",
-                name=f"Monthly {name}",
-                source_entity=self.entity_id,
-                unique_id=f"{self.unique_id}_monthly",
-                cron_pattern=None,
-                delta_values=None,
-                meter_offset=timedelta(seconds=0),
-                net_consumption=None,
-                parent_meter=self.config_entry.entry_id,  # not sure of what it does!
-                periodically_resetting=False,
-                tariff_entity=None,
-                tariff=None,
-                sensor_always_available=True,
-                device_info=self.device_info,
+                self.hass,
+                **kwargs,
             )
+
             self._async_add_entities([monthly])
 
     @callback
