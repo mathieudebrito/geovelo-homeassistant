@@ -9,17 +9,18 @@ import logging
 from functools import partial
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 from dateutil import tz
 from itertools import dropwhile, takewhile
 import aiohttp
 from dataclasses import dataclass
 from collections.abc import Callable
+from awesomeversion import AwesomeVersion
 
 from homeassistant.components.sensor.const import SensorStateClass
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.const import Platform, STATE_ON
+from homeassistant.const import Platform, STATE_ON, __short_version__ as HA_VERSION
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.config_entries import ConfigEntry
@@ -150,7 +151,7 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
     async def _load_traces(self) -> Optional[list]:
         if self.data is not None:
             # don't load from store if we already ran once
-            return self.data
+            return self.data["traces"]
         traces = await self._custom_store.async_load()
         if traces is None:
             _LOGGER.warn(
@@ -180,7 +181,7 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
             )
 
     async def update_method(self):
-        """Fetch data from API endpoint."""
+        """Fetch geovelo data from API endpoint."""
         try:
             _LOGGER.debug(
                 f"Calling update method, {len(self._listeners)} listeners subscribed"
@@ -189,7 +190,7 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
                 raise UpdateFailed(
                     "Failing update on purpose to test state restoration"
                 )
-            _LOGGER.debug("Starting collecting data")
+            _LOGGER.debug("Starting collecting geovelo data")
 
             username = self.config["username"]
             password = self.config["password"]
@@ -209,7 +210,7 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
                     start_date = last - timedelta(days=7)
             except Exception as e:
                 _LOGGER.warn(
-                    f"Impossible to load previous data from {self._custom_store.path}: {type(e).__name__} {e.args}"
+                    f"Impossible to load previous traces from {self._custom_store.path}: {type(e).__name__} {e.args}"
                 )
 
             session = async_get_clientsession(self.hass)
@@ -218,7 +219,7 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
                 await geovelo_api.authenticate(username, password)
                 new_traces = await geovelo_api.get_traces(start_date, end_date)
             except GeoveloApiError as e:
-                raise UpdateFailed(f"Failed fetching geovelo data: {e}")
+                raise UpdateFailed(f"Failed fetching geovelo traces: {e}")
 
             existing_ids = {trace["id"] for trace in traces}
             for new_trace in new_traces:
@@ -226,16 +227,30 @@ class GeoveloAPICoordinator(DataUpdateCoordinator):
                     existing_ids.add(new_trace["id"])
                     traces.append(new_trace)
             await self._store_traces(traces)
-            return traces
+
+            # we don't need to store zones on disk, it's a single call
+            try:
+                zones = await geovelo_api.get_zones()
+            except GeoveloApiError as e:
+                raise UpdateFailed(f"Failed fetching geovelo zones: {e}")
+
+
+            return {"traces": traces, "zones": zones}
         except Exception as err:
             raise UpdateFailed(f"Error communicating with API: {err}")
 
 
 class GeoveloUtilityMeterSensor(UtilityMeterSensor):
-    def __init__(self, icon, device_class, **args):
-        super().__init__(**args)
-        self._attr_device_class = device_class
-        self._attr_icon = icon
+    def __init__(self, hass, **args):
+        self._attr_device_class = args["device_class"]
+        self._attr_icon = args["icon"]
+        del args["icon"]
+        del args["device_class"]
+        if AwesomeVersion(HA_VERSION) < AwesomeVersion("2025.8"):
+            super().__init__(**args)
+        else:
+            super().__init__(hass, **args)
+
 
     @property
     def device_class(self) -> SensorDeviceClass | None:
@@ -286,24 +301,30 @@ class GeoveloSensorEntity(CoordinatorEntity, SensorEntity):
         await super().async_added_to_hass()
         if self.entity_description.monthly_utility:
             name = self.name.replace("Total ", "")
+            kwargs = {}
+            if AwesomeVersion(HA_VERSION) < AwesomeVersion("2025.8"):
+                kwargs["device_info"] = self.device_info
+            kwargs["icon"] = self.entity_description.icon
+            kwargs["device_class"] = self.entity_description.device_class
+            kwargs["meter_type"] = "monthly"
+            kwargs["name"] = f"Monthly {name}"
+            kwargs["source_entity"] = self.entity_id
+            kwargs["unique_id"] = f"{self.unique_id}_monthly"
+            kwargs["cron_pattern"] = None
+            kwargs["delta_values"] = None
+            kwargs["meter_offset"] = timedelta(seconds=0)
+            kwargs["net_consumption"] = None
+            kwargs["parent_meter"] = self.config_entry.entry_id  # not sure of what it does!
+            kwargs["periodically_resetting"] = False
+            kwargs["tariff_entity"] = None
+            kwargs["tariff"] = None
+            kwargs["sensor_always_available"] = True
+
             monthly = GeoveloUtilityMeterSensor(
-                icon=self.entity_description.icon,
-                device_class=self.entity_description.device_class,
-                meter_type="monthly",
-                name=f"Monthly {name}",
-                source_entity=self.entity_id,
-                unique_id=f"{self.unique_id}_monthly",
-                cron_pattern=None,
-                delta_values=None,
-                meter_offset=timedelta(seconds=0),
-                net_consumption=None,
-                parent_meter=self.config_entry.entry_id,  # not sure of what it does!
-                periodically_resetting=False,
-                tariff_entity=None,
-                tariff=None,
-                sensor_always_available=True,
-                device_info=self.device_info,
+                self.hass,
+                **kwargs,
             )
+
             self._async_add_entities([monthly])
 
     @callback
@@ -330,7 +351,7 @@ def sum_on_attribute_with_none(attribute_name, entries) -> int:
     return sum([el[attribute_name] or 0 for el in entries])
 
 
-def average_speed(entries):
+def average_speed(entries: list) -> Optional[float]:
     total_time = sum_on_attribute("duration", entries)
     if total_time == 0:
         return None
@@ -369,6 +390,36 @@ def consecutive_days(timezone, traces) -> Optional[int]:
     while checked_day in days_of_cycling:
         checked_day -= timedelta(days=1)
     return int((last_day_cycled - checked_day).total_seconds() / 3600 / 24)
+
+def explorer_achievement(hass, explored_zone_count):
+    if explored_zone_count >= 1000:
+        hass.bus.fire(
+            "achievement_granted",
+            {
+                "major_version": 0,
+                "minor_version": 1,
+                "achievement": {
+                    "title": "Magellan",
+                    "description": "You've explored more than 1000 zones",
+                    "source": "geovelo",
+                    "id": "109e4dcd-f83a-40d2-b61f-89e94ecf16ad",
+                },
+            },
+        )
+    if explored_zone_count >= 100:
+        hass.bus.fire(
+            "achievement_granted",
+            {
+                "major_version": 0,
+                "minor_version": 1,
+                "achievement": {
+                    "title": "Columbus",
+                    "description": "You've explored more than 100 zones",
+                    "source": "geovelo",
+                    "id": "123e4def-fffa-36d2-b65f-89e94ecf16ae",
+                },
+            },
+        )
 
 
 def non_stop_achievements(hass, consecutive_days):
@@ -433,6 +484,15 @@ def check_distance_achievement(hass, total_cycled_meters):
             },
         )
 
+def ontraces[F: Any](f: Callable[[list], F]) -> Callable[[dict], F]:
+    def w(data: dict) -> F:
+        return f(data["traces"])
+    return w
+
+def onzones[F: Any](f: Callable[[list], F]) -> Callable[[dict], F]:
+    def w(data: dict) -> F:
+        return f(data["zones"])
+    return w
 
 def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
     return [
@@ -443,7 +503,7 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
             suggested_unit_of_measurement="km",
             icon="mdi:map-marker-distance",
             device_class=SensorDeviceClass.DISTANCE,
-            compute_value=partial(sum_on_attribute, "distance"),
+            compute_value=ontraces(partial(sum_on_attribute, "distance")),
             post_compute_value=partial(check_distance_achievement, hass),
             monthly_utility=True,
             state_class=SensorStateClass.TOTAL,
@@ -454,7 +514,7 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
             native_unit_of_measurement="kg",
             device_class=SensorDeviceClass.WEIGHT,
             icon="mdi:leaf",
-            compute_value=compute_co2,
+            compute_value=ontraces(compute_co2),
             state_class=SensorStateClass.MEASUREMENT,
             suggested_display_precision=0,
         ),
@@ -462,7 +522,7 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
             key="trip_count",
             name="Number of trips",
             icon="mdi:counter",
-            compute_value=len,
+            compute_value=ontraces(len),
             monthly_utility=True,
             state_class=SensorStateClass.TOTAL,
         ),
@@ -470,23 +530,23 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
             key="night_owl_stats",
             name="Night trips",
             icon="mdi:owl",
-            compute_value=count_nightowl,
+            compute_value=ontraces(count_nightowl),
             state_class=SensorStateClass.TOTAL,
         ),
         GeoveloSensorEntityDescription(
             key="consecutive_days_of_cycling",
             name="Consecutive days of cycling",
             icon="mdi:medal",
-            compute_value=partial(
-                consecutive_days, dt_util.get_default_time_zone() 
-            ),
+            compute_value=ontraces(partial(
+                consecutive_days, dt_util.get_default_time_zone()
+            )),
             post_compute_value=partial(non_stop_achievements, hass),
             state_class=SensorStateClass.TOTAL,
         ),
         GeoveloSensorEntityDescription(
             key="cycle_time",
             name="Time cycling",
-            compute_value=partial(sum_on_attribute, "duration"),
+            compute_value=ontraces(partial(sum_on_attribute, "duration")),
             device_class=SensorDeviceClass.DURATION,
             native_unit_of_measurement="s",
             monthly_utility=True,
@@ -496,7 +556,7 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
             key="vertical_gain",
             name="Vertical gain",
             icon="mdi:summit",
-            compute_value=partial(sum_on_attribute_with_none, "vertical_gain"),
+            compute_value=ontraces(partial(sum_on_attribute_with_none, "vertical_gain")),
             device_class=SensorDeviceClass.DISTANCE,
             native_unit_of_measurement="m",
             monthly_utility=True,
@@ -505,11 +565,19 @@ def build_sensors(hass: HomeAssistant) -> list[GeoveloSensorEntityDescription]:
         GeoveloSensorEntityDescription(
             key="average_speed",
             name="Average speed",
-            compute_value=average_speed,
+            compute_value=ontraces(average_speed),
             device_class=SensorDeviceClass.SPEED,
             native_unit_of_measurement="km/h",
             suggested_display_precision=0,
             state_class=SensorStateClass.MEASUREMENT,
+        ),
+        GeoveloSensorEntityDescription(
+            key="h3_zones",
+            name="Explored zones",
+            compute_value=onzones(len),
+            post_compute_value=partial(explorer_achievement, hass),
+            icon="mdi:map",
+            state_class=SensorStateClass.TOTAL,
         ),
     ]
 
@@ -579,6 +647,6 @@ def build_images():
         GeoveloImageEntityDescription(
             key="last_trace",
             name="Last Trip",
-            compute_value=extract_last_trip_info,
+            compute_value=ontraces(extract_last_trip_info),
         )
     ]
